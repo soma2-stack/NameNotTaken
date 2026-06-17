@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { adapters } from "@/lib/platforms";
 import { runAdapter } from "@/lib/check";
 import { isPlausibleHandle, normalizeHandle } from "@/lib/validation";
+import { getUserPlan } from "@/lib/plan";
+import { entitlementFor, PREMIUM_TLD_PLATFORMS } from "@/lib/billing";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -28,12 +30,21 @@ export async function GET(request: Request) {
     );
   }
 
+  // Server-authoritative entitlement: free plans never receive the premium TLD
+  // checks (.ai/.io/.net/.co), so the paid data cannot be scraped from the API
+  // by toggling client state.
+  const { plan } = await getUserPlan();
+  const entitlement = entitlementFor(plan);
+  const activeAdapters = entitlement.premiumTlds
+    ? adapters
+    : adapters.filter((adapter) => !PREMIUM_TLD_PLATFORMS.has(adapter.name));
+
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
       await Promise.allSettled(
-        adapters.map(async (adapter) => {
+        activeAdapters.map(async (adapter) => {
           const result = await runAdapter(adapter, username);
           try {
             controller.enqueue(encoder.encode(JSON.stringify(result) + "\n"));

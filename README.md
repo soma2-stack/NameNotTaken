@@ -4,8 +4,10 @@ A fast, mobile-first **username availability checker**. Type a handle once and
 see whether it's free across major social apps, creator platforms, developer
 sites, and matching domains.
 
-Built with **Next.js (App Router) + TypeScript + Tailwind CSS**. No database,
-deploys to Vercel with zero configuration.
+Built with **Next.js (App Router) + TypeScript + Tailwind CSS**. The checker
+itself needs no database or config; accounts and payments add [Clerk](https://clerk.com)
++ [Stripe](https://stripe.com) (still no database — the plan lives in Clerk user
+metadata). Deploys to Vercel.
 
 ## Product tiers
 
@@ -33,48 +35,70 @@ deploys to Vercel with zero configuration.
 
 ---
 
-## Payments (Stripe Payment Links)
+## Accounts & payments (real per-user gating)
 
-Paid tiers use **Stripe Payment Links** — there is no backend, no database, and
-**no secret API key** anywhere in this app. You create the links in your Stripe
-dashboard and paste the public URLs into the environment.
+Paid tiers are gated **per user**: visitors sign in with [Clerk](https://clerk.com),
+pay through **server-side Stripe Checkout**, and a **Stripe webhook** writes the
+resulting plan onto the user's Clerk account. The server reads that plan on every
+request, so the unlocked state cannot be faked from the browser. **No separate
+database** is needed — Clerk user metadata stores the plan.
 
-> ⚠️ Never put a secret Stripe key (`sk_…`) in this repo, in `.env`, or in chat.
-> Only the public `https://buy.stripe.com/…` Payment Links belong here.
+> ⚠️ The Stripe **secret key**, **webhook secret**, and **price IDs** are
+> server-only. Put them in environment variables — never in the repo, in
+> client code (`NEXT_PUBLIC_…`), or in chat.
 
-**One-time setup:**
+### How it fits together
 
-1. In the [Stripe Dashboard](https://dashboard.stripe.com/), create two
-   **Products** with recurring monthly prices: **Pro** ($10/mo) and
-   **Business** ($29/mo).
-2. For each product, create a **Payment Link** (Product → **Create payment
-   link**). Copy the resulting `https://buy.stripe.com/…` URL.
-3. *(Optional but recommended)* In each Payment Link's settings, set the
-   **confirmation page** to redirect to your deployed success page:
-   - Pro → `https://YOUR_DOMAIN/success?plan=pro`
-   - Business → `https://YOUR_DOMAIN/success?plan=business`
-4. Add the two links to your environment:
+| Piece | File |
+| ----- | ---- |
+| Plan + entitlement model | [`lib/billing.ts`](lib/billing.ts) |
+| Read the caller's plan (server) | [`lib/plan.ts`](lib/plan.ts) |
+| Lazy Stripe client | [`lib/stripe.ts`](lib/stripe.ts) |
+| Attach Clerk auth to requests | [`middleware.ts`](middleware.ts) |
+| Start a subscription | `POST` [`app/api/checkout/route.ts`](app/api/checkout/route.ts) |
+| Apply plan on payment events | `POST` [`app/api/stripe/webhook/route.ts`](app/api/stripe/webhook/route.ts) |
+| Self-serve cancel/upgrade | `POST` [`app/api/billing-portal/route.ts`](app/api/billing-portal/route.ts) |
+| Expose plan to the UI | `GET` [`app/api/me/route.ts`](app/api/me/route.ts) |
+| Enforce premium TLDs | [`app/api/check/route.ts`](app/api/check/route.ts) |
 
-   ```bash
-   # .env.local for local dev — see .env.example
-   NEXT_PUBLIC_STRIPE_PRO_PAYMENT_LINK=https://buy.stripe.com/xxxxxxxxPro
-   NEXT_PUBLIC_STRIPE_BUSINESS_PAYMENT_LINK=https://buy.stripe.com/xxxxxxxxBiz
-   ```
+The premium TLD checks (`.ai`, `.io`, `.net`, `.co`) are stripped from the
+`/api/check` response for free plans, so the paid data never reaches an
+unentitled client. AI assistant and watchlist are client features unlocked by
+the verified plan returned from `/api/me`.
 
-   On Vercel, add the same two variables under **Settings → Environment
-   Variables**, then redeploy.
+### One-time setup
 
-Until the links are set, the Pro/Business buttons show a friendly "not
-configured yet" notice instead of breaking. The plan config lives in
-[`lib/billing.ts`](lib/billing.ts); the post-checkout page is
-[`app/success/page.tsx`](app/success/page.tsx).
+1. **Clerk** — create a free app at [dashboard.clerk.com](https://dashboard.clerk.com),
+   then set `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` and `CLERK_SECRET_KEY`.
+2. **Stripe products** — in the [Stripe Dashboard](https://dashboard.stripe.com/),
+   create two products with recurring monthly prices: **Pro** ($10/mo) and
+   **Business** ($29/mo). Copy each **price ID** (`price_…`) into
+   `STRIPE_PRO_PRICE_ID` / `STRIPE_BUSINESS_PRICE_ID`.
+3. **Stripe secret key** — set `STRIPE_SECRET_KEY` (use a `sk_test_…` key in dev).
+4. **Webhook** — add an endpoint at `https://YOUR_DOMAIN/api/stripe/webhook`
+   subscribed to `checkout.session.completed`,
+   `customer.subscription.created`, `customer.subscription.updated`, and
+   `customer.subscription.deleted`. Put its signing secret in
+   `STRIPE_WEBHOOK_SECRET`.
+5. **Base URL** — set `NEXT_PUBLIC_APP_URL` to your deployed origin (used for
+   Checkout success/cancel URLs).
 
-> **Note on what this does and doesn't do:** Payment Links collect payment and
-> email the customer a receipt and a self-serve billing portal. They do **not**
-> automatically unlock Pro features per logged-in user — this app has no
-> accounts or database, and the Free/Pro toggle on the page is a UI preview.
-> Gating real features behind a verified payment would require adding auth, a
-> backend, Stripe webhooks, and a database.
+See [`.env.example`](.env.example) for the full list. On Vercel, add all of the
+above under **Settings → Environment Variables**, then redeploy.
+
+### Testing locally
+
+```bash
+cp .env.example .env.local   # fill in Clerk + Stripe test values
+
+# Forward Stripe webhooks to your dev server and grab the signing secret:
+stripe listen --forward-to localhost:3000/api/stripe/webhook
+# copy the printed whsec_… into STRIPE_WEBHOOK_SECRET, then:
+npm run dev
+```
+
+Use Stripe's test card `4242 4242 4242 4242` (any future expiry / CVC) to
+complete a subscription, then watch the plan flip to Pro/Business in the app.
 
 ---
 
@@ -170,14 +194,17 @@ npm run lint    # eslint
 
 ## Deploy to Vercel
 
-This app is zero-config on Vercel.
+The checker deploys with no config; accounts and payments need their env vars set.
 
 1. Push this repo to GitHub.
 2. Go to [vercel.com/new](https://vercel.com/new) and **import** the repo.
 3. Framework preset auto-detects **Next.js** — accept the defaults.
-4. *(Optional)* Add `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` under
-   **Settings → Environment Variables** to enable the real Twitch check.
-5. Click **Deploy**.
+4. Add the **Clerk** and **Stripe** environment variables (see
+   [Accounts & payments](#accounts--payments-real-per-user-gating)) under
+   **Settings → Environment Variables** to enable sign-in and paid plans.
+5. *(Optional)* Add `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` to enable the
+   real Twitch check.
+6. Click **Deploy**.
 
 Or with the CLI:
 

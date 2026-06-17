@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { PLANS, type PaidPlan } from "@/lib/billing";
+import { PLAN_DISPLAY, type PaidPlan } from "@/lib/billing";
 
 export const metadata: Metadata = {
   title: "Thanks for upgrading — AvailifyAi",
@@ -11,8 +11,8 @@ export const metadata: Metadata = {
 /** Resolve the ?plan= query param to a known paid plan, if present. */
 function resolvePlan(value: string | string[] | undefined): PaidPlan | null {
   const raw = (Array.isArray(value) ? value[0] : value)?.toLowerCase();
-  if (raw === "pro") return "Pro";
-  if (raw === "business") return "Business";
+  if (raw === "pro") return "pro";
+  if (raw === "business") return "business";
   return null;
 }
 
@@ -22,7 +22,7 @@ export default function SuccessPage({
   searchParams: { plan?: string | string[] };
 }) {
   const plan = resolvePlan(searchParams.plan);
-  const planName = plan ? PLANS[plan].name : null;
+  const planName = plan ? PLAN_DISPLAY[plan].name : null;
 
   return (
     <main className="relative flex min-h-screen items-center justify-center bg-[#07080f] px-6 py-16 text-white">

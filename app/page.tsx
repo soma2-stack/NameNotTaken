@@ -1,11 +1,16 @@
 "use client";
 
-import { FormEvent, MouseEvent, useMemo, useRef, useState } from "react";
-import { DOMAIN_META, PLATFORM_META } from "@/lib/platform-meta";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  STRIPE_BUSINESS_PAYMENT_LINK,
-  STRIPE_PRO_PAYMENT_LINK,
-} from "@/lib/billing";
+  SignInButton,
+  SignedIn,
+  SignedOut,
+  UserButton,
+  useAuth,
+  useClerk,
+} from "@clerk/nextjs";
+import { DOMAIN_META, PLATFORM_META } from "@/lib/platform-meta";
+import { PLAN_DISPLAY, type PaidPlan, type Plan } from "@/lib/billing";
 import type { CheckResult, Status } from "@/lib/types";
 
 type Phase = "idle" | "loading" | "done" | "error";
@@ -13,8 +18,10 @@ type Phase = "idle" | "loading" | "done" | "error";
 const BRAND_NAME = "AvailifyAi";
 const SUPPORT_EMAIL = "support@availifyai.com";
 const LAST_UPDATED = "June 17, 2026";
-// Stripe Payment Links come from lib/billing.ts, which reads the NEXT_PUBLIC_
-// env vars listed in .env.example. Do not use secret Stripe keys here.
+// Payments use server-side Stripe Checkout (POST /api/checkout) tied to the
+// signed-in Clerk user. The user's real plan comes from GET /api/me, which
+// reads it from Clerk metadata written by the Stripe webhook — so the unlocked
+// state below cannot be faked from the browser.
 const PRIMARY_PLATFORM_COUNT = 8;
 const FREE_SEARCH_LIMIT = 3;
 const BULK_SEARCH_LIMIT = 20;
@@ -436,7 +443,8 @@ function PricingCard({
   cta,
   href,
   featured = false,
-  onClick,
+  onCta,
+  ctaDisabled = false,
 }: {
   eyebrow: string;
   title: string;
@@ -444,10 +452,17 @@ function PricingCard({
   description: string;
   features: string[];
   cta: string;
-  href: string;
+  href?: string;
   featured?: boolean;
-  onClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
+  /** When provided, the CTA renders as a button that calls this instead of a link. */
+  onCta?: () => void;
+  ctaDisabled?: boolean;
 }) {
+  const ctaClass = `mt-7 flex min-h-12 items-center justify-center rounded-2xl px-5 text-sm font-black disabled:opacity-60 ${
+    featured
+      ? "bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] text-[#07080f]"
+      : "border border-white/15 bg-white/[0.05] text-white hover:border-white/30"
+  }`;
   return (
     <article
       className={`relative flex h-full flex-col rounded-[28px] border p-6 ${
@@ -481,19 +496,20 @@ function PricingCard({
       </div>
       <p className="mt-4 text-sm leading-6 text-[#9298ad]">{description}</p>
       <FeatureCheckList items={features} />
-      <a
-        href={href}
-        target={href.startsWith("http") ? "_blank" : undefined}
-        rel={href.startsWith("http") ? "noopener noreferrer" : undefined}
-        onClick={onClick}
-        className={`mt-7 flex min-h-12 items-center justify-center rounded-2xl px-5 text-sm font-black ${
-          featured
-            ? "bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] text-[#07080f]"
-            : "border border-white/15 bg-white/[0.05] text-white hover:border-white/30"
-        }`}
-      >
-        {cta}
-      </a>
+      {onCta ? (
+        <button
+          type="button"
+          onClick={onCta}
+          disabled={ctaDisabled}
+          className={ctaClass}
+        >
+          {cta}
+        </button>
+      ) : (
+        <a href={href ?? "#"} className={ctaClass}>
+          {cta}
+        </a>
+      )}
     </article>
   );
 }
@@ -600,13 +616,34 @@ export default function Home() {
   const [checked, setChecked] = useState("");
   const [openFaq, setOpenFaq] = useState<number | null>(0);
   const [showAllPlatforms, setShowAllPlatforms] = useState(false);
-  const [isSubscribed, setIsSubscribed] = useState(false);
+  const [plan, setPlan] = useState<Plan>("free");
+  const [checkoutPending, setCheckoutPending] = useState(false);
+  const isSubscribed = plan !== "free";
+  const { isSignedIn } = useAuth();
+  const { openSignIn } = useClerk();
   const [searchCount, setSearchCount] = useState(0);
   const [watchlist, setWatchlist] = useState<string[]>([]);
   const [bulkQueue, setBulkQueue] = useState<string[]>([]);
   const [paymentNotice, setPaymentNotice] = useState<string | null>(null);
   const [contactSent, setContactSent] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Load the caller's real plan from the server. Re-runs when auth state
+  // changes (sign in / sign out) so unlocked features reflect the true plan.
+  useEffect(() => {
+    let active = true;
+    fetch("/api/me", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (active && data?.plan) setPlan(data.plan as Plan);
+      })
+      .catch(() => {
+        /* keep the free default on failure */
+      });
+    return () => {
+      active = false;
+    };
+  }, [isSignedIn]);
 
   const resultByName = useMemo(
     () => new Map(results.map((result) => [result.platform, result])),
@@ -751,19 +788,66 @@ export default function Home() {
     });
   }
 
-  function handlePaymentClick(
-    event: MouseEvent<HTMLAnchorElement>,
-    plan: "Pro" | "Business",
-    href: string
-  ) {
-    if (href) return;
-    event.preventDefault();
-    setPaymentNotice(
-      `${plan} payment link not configured yet. Add the Stripe Payment Link in .env.local, then redeploy.`
-    );
-    document
-      .getElementById("pricing")
-      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  async function startCheckout(target: PaidPlan) {
+    setPaymentNotice(null);
+
+    // Must be signed in to attach the subscription to an account.
+    if (!isSignedIn) {
+      openSignIn({
+        // Bring them back to pricing after signing in; they tap upgrade again.
+        afterSignInUrl:
+          typeof window !== "undefined"
+            ? `${window.location.origin}/#pricing`
+            : undefined,
+      });
+      return;
+    }
+
+    setCheckoutPending(true);
+    try {
+      const res = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: target }),
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { url?: string; error?: string }
+        | null;
+      if (res.ok && data?.url) {
+        window.location.href = data.url;
+        return;
+      }
+      setPaymentNotice(data?.error ?? "Could not start checkout. Please try again.");
+    } catch {
+      setPaymentNotice("Could not start checkout. Please try again.");
+    } finally {
+      setCheckoutPending(false);
+    }
+  }
+
+  async function openBillingPortal() {
+    setPaymentNotice(null);
+    try {
+      const res = await fetch("/api/billing-portal", { method: "POST" });
+      const data = (await res.json().catch(() => null)) as
+        | { url?: string; error?: string }
+        | null;
+      if (res.ok && data?.url) {
+        window.location.href = data.url;
+        return;
+      }
+      setPaymentNotice(data?.error ?? "Could not open the billing portal.");
+    } catch {
+      setPaymentNotice("Could not open the billing portal.");
+    }
+  }
+
+  function onCtaForPlan(target: PaidPlan) {
+    if (plan === target) {
+      void openBillingPortal();
+    } else {
+      void startCheckout(target);
+    }
   }
 
   function onContactSubmit(event: FormEvent<HTMLFormElement>) {
@@ -810,12 +894,27 @@ export default function Home() {
             FAQ
           </a>
         </nav>
-        <a
-          href="#search"
-          className="ml-auto rounded-xl bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] px-5 py-2.5 text-sm font-black text-[#07080f] shadow-[0_12px_30px_rgba(91,140,255,0.25)]"
-        >
-          Try Free
-        </a>
+        <div className="ml-auto flex items-center gap-3">
+          <SignedOut>
+            <SignInButton mode="modal">
+              <button
+                type="button"
+                className="rounded-xl border border-white/15 px-4 py-2.5 text-sm font-bold text-[#c2c7d8] transition hover:border-white/30 hover:text-white"
+              >
+                Sign in
+              </button>
+            </SignInButton>
+          </SignedOut>
+          <SignedIn>
+            <UserButton afterSignOutUrl="/" />
+          </SignedIn>
+          <a
+            href="#search"
+            className="rounded-xl bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] px-5 py-2.5 text-sm font-black text-[#07080f] shadow-[0_12px_30px_rgba(91,140,255,0.25)]"
+          >
+            Try Free
+          </a>
+        </div>
       </header>
 
       <section
@@ -834,29 +933,41 @@ export default function Home() {
           smarter alternatives when your first idea is taken.
         </p>
 
-        <div className="mx-auto mt-8 flex max-w-[700px] items-center justify-center rounded-2xl border border-white/10 bg-white/[0.035] p-1">
-          <button
-            type="button"
-            onClick={() => setIsSubscribed(false)}
-            className={`min-h-10 flex-1 rounded-xl px-4 py-2 text-sm font-black transition ${
-              !isSubscribed
-                ? "bg-white text-[#07080f]"
-                : "text-[#aab0c4] hover:text-white"
-            }`}
-          >
-            Free preview
-          </button>
-          <button
-            type="button"
-            onClick={() => setIsSubscribed(true)}
-            className={`min-h-10 flex-1 rounded-xl px-4 py-2 text-sm font-black transition ${
-              isSubscribed
-                ? "bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] text-[#07080f]"
-                : "text-[#aab0c4] hover:text-white"
-            }`}
-          >
-            Pro preview
-          </button>
+        <div className="mx-auto mt-8 flex max-w-[700px] flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.035] px-4 py-3 text-left">
+          <div className="flex items-center gap-3">
+            <span
+              className={`rounded-full border px-3 py-1 text-xs font-black ${
+                isSubscribed
+                  ? "border-[#5b8cff]/40 bg-[#5b8cff]/10 text-[#8fb0ff]"
+                  : "border-white/10 bg-black/25 text-[#9298ad]"
+              }`}
+            >
+              {PLAN_DISPLAY[plan].name} plan
+            </span>
+            <span className="text-sm font-semibold text-[#9298ad]">
+              {isSubscribed
+                ? "All features unlocked."
+                : "3 searches · .com only. Upgrade to unlock everything."}
+            </span>
+          </div>
+          {isSubscribed ? (
+            <button
+              type="button"
+              onClick={() => void openBillingPortal()}
+              className="rounded-xl border border-white/15 px-4 py-2 text-sm font-bold text-[#c2c7d8] transition hover:border-white/30 hover:text-white"
+            >
+              Manage billing
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void startCheckout("pro")}
+              disabled={checkoutPending}
+              className="rounded-xl bg-gradient-to-br from-[#5b8cff] to-[#8a7bff] px-4 py-2 text-sm font-black text-[#07080f] transition disabled:opacity-60"
+            >
+              {checkoutPending ? "Starting…" : "Upgrade to Pro"}
+            </button>
+          )}
         </div>
 
         <form onSubmit={onSubmit} className="mx-auto mt-5 max-w-[700px]">
@@ -1358,12 +1469,16 @@ export default function Home() {
             price="$10"
             description="The serious naming workspace for creators, founders, and builders."
             features={PRO_TIER_FEATURES}
-            cta="Upgrade to Pro"
-            href={STRIPE_PRO_PAYMENT_LINK || "#pricing"}
-            featured
-            onClick={(event) =>
-              handlePaymentClick(event, "Pro", STRIPE_PRO_PAYMENT_LINK)
+            cta={
+              plan === "pro"
+                ? "Manage billing"
+                : checkoutPending
+                  ? "Starting…"
+                  : "Upgrade to Pro"
             }
+            featured
+            onCta={() => onCtaForPlan("pro")}
+            ctaDisabled={checkoutPending}
           />
           <PricingCard
             eyebrow="Business"
@@ -1371,15 +1486,15 @@ export default function Home() {
             price="$29"
             description="More room and support for teams comparing names across client or product work."
             features={BUSINESS_TIER_FEATURES}
-            cta="Choose Business"
-            href={STRIPE_BUSINESS_PAYMENT_LINK || "#pricing"}
-            onClick={(event) =>
-              handlePaymentClick(
-                event,
-                "Business",
-                STRIPE_BUSINESS_PAYMENT_LINK
-              )
+            cta={
+              plan === "business"
+                ? "Manage billing"
+                : checkoutPending
+                  ? "Starting…"
+                  : "Choose Business"
             }
+            onCta={() => onCtaForPlan("business")}
+            ctaDisabled={checkoutPending}
           />
         </div>
       </section>
