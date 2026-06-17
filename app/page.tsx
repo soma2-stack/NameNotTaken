@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { PLATFORM_META } from "@/lib/platform-meta";
 import type { CheckResult } from "@/lib/types";
 import { LoadingRow, ResultRow } from "./components/ResultRow";
@@ -14,10 +14,17 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [checked, setChecked] = useState<string>("");
 
+  // Abort any in-flight request when a new submission starts.
+  const abortRef = useRef<AbortController | null>(null);
+
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     const handle = username.trim().replace(/^@+/, "");
     if (!handle) return;
+
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
 
     setPhase("loading");
     setError(null);
@@ -25,17 +32,50 @@ export default function Home() {
     setChecked(handle);
 
     try {
-      const res = await fetch(`/api/check?username=${encodeURIComponent(handle)}`);
+      const res = await fetch(
+        `/api/check?username=${encodeURIComponent(handle)}`,
+        { signal: ctrl.signal }
+      );
+
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as
           | { error?: string }
           | null;
         throw new Error(body?.error ?? `Request failed (${res.status})`);
       }
-      const data = (await res.json()) as CheckResult[];
-      setResults(data);
-      setPhase("done");
+
+      if (!res.body) throw new Error("No response body");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        // Last element may be a partial line; keep it in the buffer.
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const result = JSON.parse(trimmed) as CheckResult;
+          setResults((prev) => [...prev, result]);
+        }
+      }
+
+      // Flush any remaining buffer content (last line without trailing newline).
+      const remaining = buffer.trim();
+      if (remaining) {
+        const result = JSON.parse(remaining) as CheckResult;
+        setResults((prev) => [...prev, result]);
+      }
+
+      if (!ctrl.signal.aborted) setPhase("done");
     } catch (err) {
+      // Intentional abort from a new submission — don't overwrite the new state.
+      if (ctrl.signal.aborted) return;
       setError(err instanceof Error ? err.message : "Something went wrong.");
       setPhase("error");
     }
@@ -107,9 +147,13 @@ export default function Home() {
           )}
 
           <ul className="flex flex-col gap-2">
-            {phase === "loading"
-              ? PLATFORM_META.map((p) => <LoadingRow key={p.name} name={p.name} />)
-              : results.map((r) => <ResultRow key={r.platform} result={r} />)}
+            {PLATFORM_META.map((p) => {
+              const r = results.find((r) => r.platform === p.name);
+              if (r) return <ResultRow key={p.name} result={r} />;
+              if (phase === "loading")
+                return <LoadingRow key={p.name} name={p.name} />;
+              return null;
+            })}
           </ul>
         </section>
       )}
@@ -117,7 +161,7 @@ export default function Home() {
       <footer className="mt-auto pt-10 text-center text-xs text-neutral-600">
         <p>
           Tier A checks are real (GitHub, Reddit, YouTube). Tier B is best-effort
-          and may report “unknown” — use the Open ↗ link to verify.
+          and may report &ldquo;unknown&rdquo; — use the Open ↗ link to verify.
         </p>
       </footer>
     </main>

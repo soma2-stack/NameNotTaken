@@ -8,7 +8,7 @@ import type { CheckResult, PlatformAdapter } from "./types";
  *  2. cache hit       → return cached result
  *  3. otherwise       → run the check, catching every error → "unknown"
  */
-async function runAdapter(
+export async function runAdapter(
   adapter: PlatformAdapter,
   username: string
 ): Promise<CheckResult> {
