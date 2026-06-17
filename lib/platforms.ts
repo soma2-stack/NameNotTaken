@@ -1,3 +1,4 @@
+import dns from "node:dns/promises";
 import { fetchWithTimeout, USER_AGENT } from "./http";
 import { validators } from "./validation";
 import type { CheckResult, PlatformAdapter, Status } from "./types";
@@ -259,6 +260,81 @@ const twitch: PlatformAdapter = {
   },
 };
 
+/* -------------------------------------------------------------------------- */
+/*  Domains                                                                    */
+/* -------------------------------------------------------------------------- */
+
+const DOMAIN_TIMEOUT_MS = 3000;
+
+function domainLabelOk(u: string): boolean {
+  return (
+    u.length >= 1 &&
+    u.length <= 63 &&
+    /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(u)
+  );
+}
+
+function getErrorCode(err: unknown): string {
+  if (err && typeof err === "object" && "code" in err) {
+    return String((err as { code?: unknown }).code ?? "");
+  }
+  return "";
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function checkDomain(
+  extension: ".com" | ".io",
+  username: string
+): Promise<CheckResult> {
+  const label = username.toLowerCase();
+  const domain = `${label}${extension}`;
+  const platform = `Domain ${extension}`;
+  const profileUrl = `https://www.whois.com/whois/${enc(domain)}`;
+
+  try {
+    await withTimeout(dns.resolveSoa(domain), DOMAIN_TIMEOUT_MS);
+    return result(platform, "taken", "DNS lookup", profileUrl);
+  } catch (err) {
+    const code = getErrorCode(err);
+    if (code === "ENOTFOUND") {
+      return result(platform, "available", "DNS lookup", profileUrl);
+    }
+    if (err instanceof Error && err.message === "timeout") {
+      return result(platform, "unknown", "DNS lookup", profileUrl, "timeout");
+    }
+    return result(platform, "unknown", "DNS lookup", profileUrl, code || "ambiguous");
+  }
+}
+
+const domainCom: PlatformAdapter = {
+  name: "Domain .com",
+  tier: "A",
+  profileUrl: (u) => `https://www.whois.com/whois/${enc(`${u.toLowerCase()}.com`)}`,
+  validate: domainLabelOk,
+  check: (u) => checkDomain(".com", u),
+};
+
+const domainIo: PlatformAdapter = {
+  name: "Domain .io",
+  tier: "A",
+  profileUrl: (u) => `https://www.whois.com/whois/${enc(`${u.toLowerCase()}.io`)}`,
+  validate: domainLabelOk,
+  check: (u) => checkDomain(".io", u),
+};
+
 /** Registry, in display order. */
 export const adapters: PlatformAdapter[] = [
   github,
@@ -269,6 +345,8 @@ export const adapters: PlatformAdapter[] = [
   instagram,
   threads,
   twitch,
+  domainCom,
+  domainIo,
 ];
 
 export { USER_AGENT };
